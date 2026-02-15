@@ -8,27 +8,25 @@ from mutagen.id3 import ID3, TIT2, TPE1, APIC
 # --- WEB SERVER FOR UPTIMEROBOT ---
 server = Flask(__name__)
 @server.route('/')
-def ping(): return "SoundCloud Bot is Alive", 200
+def ping(): return "SoundCloud Bot Alive", 200
 
 def run_web_server():
     server.run(host='0.0.0.0', port=10000)
 
 # --- CONFIGURATION ---
 TOKEN = "8401688638:AAHS9eelsM63xF6lqWXkC4n5GbFLCGg8y58"
+# Temporary storage for URLs to bypass Telegram's 64-character limit
+url_map = {}
 
 # --- HELPER: CLEAN TITLES ---
 def clean_metadata(raw_title, uploader):
-    # SoundCloud titles often already have Artist - Title
     clean = re.sub(r'\([^)]*\)|\[[^\]]*\]', '', raw_title)
     clean = clean.replace('|', '').replace('  ', ' ').strip()
-    
     if " - " in clean:
         artist, song = clean.split(" - ", 1)
     else:
-        # If no dash, use the SoundCloud uploader name as Artist
         artist = uploader
         song = clean
-        
     return artist.strip(), song.strip()
 
 # --- BOT HANDLERS ---
@@ -37,41 +35,45 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def search_music(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.message.text
-    status = await update.message.reply_text(f"🔍 Searching SoundCloud for: {query}...")
+    status = await update.message.reply_text(f"🔍 Searching: {query}...")
 
-    # CHANGED TO SCSEARCH
-    ydl_opts = {
-        'format': 'bestaudio', 
-        'noplaylist': True, 
-        'quiet': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
-    
+    ydl_opts = {'format': 'bestaudio', 'noplaylist': True, 'quiet': True}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
-            # Prefix changed to scsearch
             info = ydl.extract_info(f"scsearch5:{query}", download=False)
             results = info['entries']
         except Exception as e:
-            await status.edit_text(f"❌ SoundCloud search failed: {str(e)}")
+            await status.edit_text(f"❌ Search failed: {str(e)}")
             return
 
     if not results:
         await status.edit_text("❌ No results found.")
         return
 
-    buttons = [[InlineKeyboardButton(r.get('title', 'Unknown')[:55], callback_data=r.get('url'))] for r in results]
-    await status.edit_text("✅ Select from SoundCloud:", reply_markup=InlineKeyboardMarkup(buttons))
+    buttons = []
+    for r in results:
+        # Create a short unique ID for this specific button
+        short_id = str(uuid.uuid4())[:8]
+        url_map[short_id] = r.get('url') # Save the long URL in our map
+        buttons.append([InlineKeyboardButton(r.get('title', 'Track')[:55], callback_data=short_id)])
+
+    await status.edit_text("✅ Select a version:", reply_markup=InlineKeyboardMarkup(buttons))
 
 async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    sc_url = query.data # SoundCloud uses full URLs for callback safely
+    short_id = query.data
+    sc_url = url_map.get(short_id) # Retrieve the long URL
+    
+    if not sc_url:
+        await query.edit_message_text("❌ Link expired. Please search again.")
+        return
+
     unique_id = str(uuid.uuid4())
     file_path = f"{unique_id}.mp3"
 
-    await query.edit_message_text("🚀 Downloading from SoundCloud...")
+    await query.edit_message_text("🚀 Downloading...")
 
     ydl_opts = {
         'format': 'bestaudio/best',
@@ -81,10 +83,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
             'preferredquality': '192',
-        }, {
-            'key': 'FFmpegThumbnailsConvertor',
-            'format': 'jpg',
-        }],
+        }, {'key': 'FFmpegThumbnailsConvertor', 'format': 'jpg'}],
         'quiet': True,
     }
 
@@ -93,12 +92,11 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             info = ydl.extract_info(sc_url, download=True)
             artist, song = clean_metadata(info.get('title', 'Unknown'), info.get('uploader', 'Unknown'))
 
-        # Inject Metadata
+        # Metadata injection
         audio = ID3(file_path)
         audio.add(TPE1(encoding=3, text=artist))
         audio.add(TIT2(encoding=3, text=song))
         
-        # Add Thumbnail
         thumb_path = f"{unique_id}.jpg"
         if os.path.exists(thumb_path):
             with open(thumb_path, 'rb') as img:
@@ -110,15 +108,16 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             audio=open(file_path, 'rb'),
             performer=artist,
             title=song,
-            caption=f"☁️ **{artist} - {song}**",
+            caption=f"✅ **{artist} - {song}**",
             parse_mode="Markdown"
         )
         await query.message.delete()
+        del url_map[short_id] # Clean up the map
     except Exception as e:
         await query.message.reply_text(f"❌ Error: {str(e)}")
     finally:
-        for ext in ['.mp3', '.jpg', '.webp', '.png', '.original']:
-            if os.path.exists(unique_id + ext): os.remove(unique_id + ext)
+        for ext in ['.mp3', '.jpg', '.webp', '.png']:
+            if os.remove(unique_id + ext) if os.path.exists(unique_id + ext) else None: pass
 
 if __name__ == '__main__':
     threading.Thread(target=run_web_server, daemon=True).start()
